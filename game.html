@@ -1,0 +1,500 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>지뢰찾기 게임</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            min-height: 100vh;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            font-family: 'Arial', sans-serif;
+        }
+
+        #game-container {
+            box-shadow: 0 10px 40px rgba(0, 0, 0, 0.3);
+            border-radius: 10px;
+            overflow: hidden;
+        }
+    </style>
+</head>
+<body>
+    <div id="game-container"></div>
+    
+    <script src="https://cdn.jsdelivr.net/npm/phaser@3.55.2/dist/phaser.min.js"></script>
+    <script>
+        // ========================================
+        // MineGenerator 유틸리티
+        // ========================================
+        class MineGenerator {
+            static generate(rows, cols, mineCount, excludeRow, excludeCol) {
+                const mines = [];
+                const usedPositions = new Set();
+                
+                usedPositions.add(`${excludeRow},${excludeCol}`);
+                
+                while (mines.length < mineCount) {
+                    const row = Math.floor(Math.random() * rows);
+                    const col = Math.floor(Math.random() * cols);
+                    const key = `${row},${col}`;
+                    
+                    if (!usedPositions.has(key)) {
+                        usedPositions.add(key);
+                        mines.push({ row, col });
+                    }
+                }
+                
+                return mines;
+            }
+        }
+
+        // ========================================
+        // Cell 클래스
+        // ========================================
+        class Cell extends Phaser.Events.EventEmitter {
+            constructor(scene, x, y, size, row, col) {
+                super();
+                
+                this.scene = scene;
+                this.x = x;
+                this.y = y;
+                this.size = size;
+                this.row = row;
+                this.col = col;
+                
+                this.isMine = false;
+                this.isRevealed = false;
+                this.isFlagged = false;
+                this.adjacentMines = 0;
+                
+                this.createGraphics();
+                this.setupInteraction();
+            }
+
+            createGraphics() {
+                const padding = 2;
+                
+                this.background = this.scene.add.rectangle(
+                    this.x, 
+                    this.y, 
+                    this.size - padding, 
+                    this.size - padding, 
+                    0x95a5a6
+                );
+                this.background.setStrokeStyle(2, 0x7f8c8d);
+
+                this.text = this.scene.add.text(this.x, this.y, '', {
+                    fontSize: '32px',
+                    fontFamily: 'Arial',
+                    fontStyle: 'bold',
+                    color: '#ffffff'
+                }).setOrigin(0.5, 0.5).setVisible(false);
+
+                this.emptyIndicator = this.scene.add.circle(
+                    this.x, 
+                    this.y, 
+                    4, 
+                    0xbdc3c7
+                ).setVisible(false);
+            }
+
+            setupInteraction() {
+                this.background.setInteractive({ useHandCursor: true });
+                
+                this.background.on('pointerdown', (pointer) => {
+                    if (pointer.leftButtonDown()) {
+                        this.emit('leftClick', this);
+                    } else if (pointer.rightButtonDown()) {
+                        this.emit('rightClick', this);
+                    }
+                });
+
+                this.background.on('pointerover', () => {
+                    if (!this.isRevealed && !this.isFlagged) {
+                        this.background.setFillStyle(0xa8b9ba);
+                    }
+                });
+
+                this.background.on('pointerout', () => {
+                    if (!this.isRevealed && !this.isFlagged) {
+                        this.background.setFillStyle(0x95a5a6);
+                    }
+                });
+
+                this.scene.input.mouse.disableContextMenu();
+            }
+
+            setMine(isMine) {
+                this.isMine = isMine;
+            }
+
+            setAdjacentMines(count) {
+                this.adjacentMines = count;
+            }
+
+            reveal() {
+                if (this.isRevealed) return;
+                
+                this.isRevealed = true;
+                this.background.setFillStyle(0xecf0f1);
+                
+                if (this.isMine) {
+                    this.text.setText('💣');
+                    this.text.setVisible(true);
+                    this.background.setFillStyle(0xe74c3c);
+                } else if (this.adjacentMines > 0) {
+                    this.text.setText(this.adjacentMines.toString());
+                    this.text.setColor(this.getNumberColor(this.adjacentMines));
+                    this.text.setVisible(true);
+                } else {
+                    this.background.setFillStyle(0xd5dbdb);
+                    this.emptyIndicator.setVisible(true);
+                }
+            }
+
+            setFlag() {
+                if (this.isRevealed) return;
+                
+                this.isFlagged = true;
+                this.text.setText('🚩');
+                this.text.setVisible(true);
+                this.background.setFillStyle(0xf39c12);
+            }
+
+            removeFlag() {
+                this.isFlagged = false;
+                this.text.setVisible(false);
+                this.background.setFillStyle(0x95a5a6);
+            }
+
+            getNumberColor(num) {
+                const colors = [
+                    '#3498db', '#2ecc71', '#e74c3c', '#9b59b6',
+                    '#f39c12', '#1abc9c', '#34495e', '#e67e22'
+                ];
+                return colors[num - 1] || '#000000';
+            }
+
+            destroy() {
+                this.background.destroy();
+                this.text.destroy();
+                this.emptyIndicator.destroy();
+            }
+        }
+
+        // ========================================
+        // Board 클래스
+        // ========================================
+        class Board extends Phaser.Events.EventEmitter {
+            constructor(scene, x, y, rows, cols, mineCount) {
+                super();
+                
+                this.scene = scene;
+                this.centerX = x;
+                this.centerY = y;
+                this.rows = rows;
+                this.cols = cols;
+                this.mineCount = mineCount;
+                this.flagCount = 0;
+                
+                this.cellSize = 60;
+                this.cells = [];
+                this.gameStarted = false;
+                
+                this.createBoard();
+            }
+
+            createBoard() {
+                const boardWidth = this.cols * this.cellSize;
+                const boardHeight = this.rows * this.cellSize;
+                const startX = this.centerX - boardWidth / 2;
+                const startY = this.centerY - boardHeight / 2;
+
+                for (let row = 0; row < this.rows; row++) {
+                    this.cells[row] = [];
+                    for (let col = 0; col < this.cols; col++) {
+                        const x = startX + col * this.cellSize + this.cellSize / 2;
+                        const y = startY + row * this.cellSize + this.cellSize / 2;
+                        
+                        const cell = new Cell(this.scene, x, y, this.cellSize, row, col);
+                        cell.on('leftClick', this.handleLeftClick, this);
+                        cell.on('rightClick', this.handleRightClick, this);
+                        
+                        this.cells[row][col] = cell;
+                    }
+                }
+            }
+
+            initializeMines(excludeRow, excludeCol) {
+                const minePositions = MineGenerator.generate(
+                    this.rows, 
+                    this.cols, 
+                    this.mineCount, 
+                    excludeRow, 
+                    excludeCol
+                );
+
+                minePositions.forEach(({ row, col }) => {
+                    this.cells[row][col].setMine(true);
+                });
+
+                this.calculateAdjacentMines();
+                this.gameStarted = true;
+            }
+
+            calculateAdjacentMines() {
+                for (let row = 0; row < this.rows; row++) {
+                    for (let col = 0; col < this.cols; col++) {
+                        if (!this.cells[row][col].isMine) {
+                            const count = this.countAdjacentMines(row, col);
+                            this.cells[row][col].setAdjacentMines(count);
+                        }
+                    }
+                }
+            }
+
+            countAdjacentMines(row, col) {
+                let count = 0;
+                const neighbors = this.getNeighbors(row, col);
+                
+                neighbors.forEach(cell => {
+                    if (cell.isMine) count++;
+                });
+                
+                return count;
+            }
+
+            getNeighbors(row, col) {
+                const neighbors = [];
+                
+                for (let dr = -1; dr <= 1; dr++) {
+                    for (let dc = -1; dc <= 1; dc++) {
+                        if (dr === 0 && dc === 0) continue;
+                        
+                        const newRow = row + dr;
+                        const newCol = col + dc;
+                        
+                        if (this.isValidPosition(newRow, newCol)) {
+                            neighbors.push(this.cells[newRow][newCol]);
+                        }
+                    }
+                }
+                
+                return neighbors;
+            }
+
+            isValidPosition(row, col) {
+                return row >= 0 && row < this.rows && col >= 0 && col < this.cols;
+            }
+
+            handleLeftClick(cell) {
+                if (cell.isRevealed || cell.isFlagged) return;
+
+                if (!this.gameStarted) {
+                    this.initializeMines(cell.row, cell.col);
+                }
+
+                if (cell.isMine) {
+                    this.revealAllMines();
+                    this.emit('gameOver');
+                    return;
+                }
+
+                this.revealCell(cell);
+                this.checkVictory();
+            }
+
+            handleRightClick(cell) {
+                if (cell.isRevealed) return;
+
+                if (cell.isFlagged) {
+                    cell.removeFlag();
+                    this.flagCount--;
+                } else {
+                    if (this.flagCount >= this.mineCount) return;
+                    cell.setFlag();
+                    this.flagCount++;
+                }
+
+                this.emit('mineCountUpdate', this.mineCount - this.flagCount);
+            }
+
+            revealCell(cell) {
+                if (cell.isRevealed || cell.isFlagged) return;
+
+                cell.reveal();
+
+                if (cell.adjacentMines === 0) {
+                    const neighbors = this.getNeighbors(cell.row, cell.col);
+                    neighbors.forEach(neighbor => this.revealCell(neighbor));
+                }
+            }
+
+            revealAllMines() {
+                for (let row = 0; row < this.rows; row++) {
+                    for (let col = 0; col < this.cols; col++) {
+                        const cell = this.cells[row][col];
+                        if (cell.isMine) {
+                            cell.reveal();
+                        }
+                    }
+                }
+            }
+
+            checkVictory() {
+                let revealedCount = 0;
+                const totalSafeCells = this.rows * this.cols - this.mineCount;
+
+                for (let row = 0; row < this.rows; row++) {
+                    for (let col = 0; col < this.cols; col++) {
+                        if (this.cells[row][col].isRevealed && !this.cells[row][col].isMine) {
+                            revealedCount++;
+                        }
+                    }
+                }
+
+                if (revealedCount === totalSafeCells) {
+                    this.emit('victory');
+                }
+            }
+
+            destroy() {
+                for (let row = 0; row < this.rows; row++) {
+                    for (let col = 0; col < this.cols; col++) {
+                        this.cells[row][col].destroy();
+                    }
+                }
+                this.cells = [];
+            }
+        }
+
+        // ========================================
+        // GameScene
+        // ========================================
+        class GameScene extends Phaser.Scene {
+            constructor() {
+                super({ key: 'GameScene' });
+            }
+
+            create() {
+                this.setupUI();
+                this.startNewGame();
+            }
+
+            setupUI() {
+                const headerBg = this.add.rectangle(320, 40, 640, 80, 0x34495e);
+                
+                this.mineCountText = this.add.text(50, 40, '💣 10', {
+                    fontSize: '32px',
+                    fontFamily: 'Arial',
+                    color: '#e74c3c'
+                }).setOrigin(0, 0.5);
+
+                this.timerText = this.add.text(590, 40, '⏱ 0', {
+                    fontSize: '32px',
+                    fontFamily: 'Arial',
+                    color: '#3498db'
+                }).setOrigin(1, 0.5);
+
+                this.resetButton = this.add.text(320, 40, '🔄', {
+                    fontSize: '48px'
+                }).setOrigin(0.5, 0.5)
+                  .setInteractive({ useHandCursor: true })
+                  .on('pointerdown', () => this.startNewGame());
+
+                this.startTime = Date.now();
+                this.timerEvent = this.time.addEvent({
+                    delay: 1000,
+                    callback: this.updateTimer,
+                    callbackScope: this,
+                    loop: true
+                });
+            }
+
+            startNewGame() {
+                if (this.board) {
+                    this.board.destroy();
+                }
+
+                this.board = new Board(this, 320, 440, 8, 8, 10);
+                this.board.on('gameOver', this.handleGameOver, this);
+                this.board.on('victory', this.handleVictory, this);
+                this.board.on('mineCountUpdate', this.updateMineCount, this);
+
+                this.startTime = Date.now();
+                this.gameEnded = false;
+                this.updateMineCount(10);
+            }
+
+            updateTimer() {
+                if (!this.gameEnded) {
+                    const elapsed = Math.floor((Date.now() - this.startTime) / 1000);
+                    this.timerText.setText(`⏱ ${elapsed}`);
+                }
+            }
+
+            updateMineCount(count) {
+                this.mineCountText.setText(`💣 ${count}`);
+            }
+
+            handleGameOver() {
+                this.gameEnded = true;
+                this.showMessage('💥 게임 오버!', 0xe74c3c);
+            }
+
+            handleVictory() {
+                this.gameEnded = true;
+                const elapsed = Math.floor((Date.now() - this.startTime) / 1000);
+                this.showMessage(`🎉 승리!\n${elapsed}초`, 0x2ecc71);
+            }
+
+            showMessage(text, color) {
+                const overlay = this.add.rectangle(320, 360, 640, 720, 0x000000, 0.7);
+                
+                const messageBg = this.add.rectangle(320, 360, 400, 200, color);
+                messageBg.setStrokeStyle(4, 0xffffff);
+
+                const messageText = this.add.text(320, 360, text, {
+                    fontSize: '48px',
+                    fontFamily: 'Arial',
+                    color: '#ffffff',
+                    align: 'center'
+                }).setOrigin(0.5, 0.5);
+
+                this.time.delayedCall(2000, () => {
+                    overlay.destroy();
+                    messageBg.destroy();
+                    messageText.destroy();
+                });
+            }
+        }
+
+        // ========================================
+        // Phaser 게임 설정 및 시작
+        // ========================================
+        const config = {
+            type: Phaser.AUTO,
+            width: 640,
+            height: 720,
+            parent: 'game-container',
+            backgroundColor: '#2c3e50',
+            scene: [GameScene],
+            scale: {
+                mode: Phaser.Scale.FIT,
+                autoCenter: Phaser.Scale.CENTER_BOTH
+            }
+        };
+
+        const game = new Phaser.Game(config);
+    </script>
+</body>
+</html>
